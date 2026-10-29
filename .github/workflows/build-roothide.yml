@@ -173,7 +173,11 @@ jobs:
           deb="$VZ_BUILD_ROOT/roothide/VirtualMac_roothide.deb"
           [[ -f "$deb" ]] || { echo "roothide deb not found at $deb" >&2; exit 1; }
           dpkg-deb -I "$deb"
-          dpkg-deb -c "$deb" | head -20
+          # Keep the listing bounded without piping into head: `set -o pipefail`
+          # plus an early-closing reader kills dpkg-deb with SIGPIPE.
+          dpkg-deb -c "$deb" > "$RUNNER_TEMP/package-contents.txt"
+          head -20 "$RUNNER_TEMP/package-contents.txt"
+          echo "... $(wc -l < "$RUNNER_TEMP/package-contents.txt") entries"
           size="$(du -h "$deb" | awk '{print $1}')"
           sha="$(shasum -a 256 "$deb" | awk '{print $1}')"
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
