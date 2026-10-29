@@ -1,0 +1,214 @@
+name: Build roothide deb
+
+# Builds the Dopamine-roothide package variant of Virtual Mac on iPad.
+#
+# The project does not use Theos. Its build scripts need macOS-only tools
+# (xcrun, ditto, plutil, xattr, ibtool, sips), so this runs on a macOS runner.
+#
+# Modes:
+#   basedeb (default) - Reuse the released standard deb as the payload base and
+#     recompile every component of this branch (host app, launcher, VMM,
+#     installation, graphics, SpringBoard, path interpose dylibs) against the
+#     pinned Dopamine-roothide devkit. This is the flow the project documents
+#     as VZ_BASE_DEB; it needs no Apple restore images and finishes quickly.
+#   full - Run setup.sh to rebuild the whole thing from source. It downloads the
+#     Apple restore images itself (macOS 13.2.1 22D68, macOS 11.6 20G165,
+#     iPadOS 14.5 18E199, macOS 27 DeviceSupport dmg) plus extracted dyld shared
+#     caches: tens of GB of disk and several hours. Use a larger macOS runner or
+#     a self-hosted Mac before enabling it.
+#
+# Result: build/roothide/VirtualMac_roothide.deb
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Build mode'
+        type: choice
+        required: true
+        default: 'basedeb'
+        options:
+          - basedeb
+          - full
+      base_deb_url:
+        description: 'basedeb: direct URL of the standard com.mac.virtual deb'
+        required: false
+        default: 'https://github.com/nfzerox/VirtualMacOniPad/releases/download/1.2.3/VirtualMac_1.2.3.deb'
+      base_deb_sha256:
+        description: 'basedeb: optional sha256 of that deb (pin it for reproducible builds)'
+        required: false
+        default: '435ce1dc76b9e18b1547c77b84e2cf33ffe40a16be63e366f181d14709a41aa0'
+      xcode_app:
+        description: 'Xcode app to use, without .app (empty = /Applications/Xcode.app)'
+        required: false
+        default: ''
+      development:
+        description: 'basedeb: build the development variant (extra guest diagnostics)'
+        type: boolean
+        required: false
+        default: false
+      publish_release:
+        description: 'Create or update a release and attach the deb'
+        type: boolean
+        required: false
+        default: false
+      release_tag:
+        description: 'Tag used by publish_release'
+        required: false
+        default: 'roothide-nightly'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-roothide-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VZ_BUILD_ROOT: ${{ github.workspace }}/build
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  build:
+    name: ${{ github.event.inputs.mode == 'full' && 'full rebuild' || 'basedeb recompile' }}
+    runs-on: macos-15
+    timeout-minutes: ${{ github.event.inputs.mode == 'full' && 340 || 45 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # build-roothide-deb.sh puts `git rev-list --count HEAD` and HEAD sha
+          # into the package version, so the full history is required.
+          fetch-depth: 0
+
+      - name: Select Xcode
+        env:
+          XCODE_APP: ${{ github.event.inputs.xcode_app }}
+        run: |
+          set -euo pipefail
+          app="${XCODE_APP:-Xcode}"
+          developer="/Applications/$app.app/Contents/Developer"
+          sudo xcode-select -s "$developer"
+          echo "DEVELOPER_DIR=$developer" >> "$GITHUB_ENV"
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-path
+          sw_vers
+          df -h .
+
+      - name: Install macOS build dependencies
+        run: |
+          set -euo pipefail
+          brew update >/dev/null 2>&1 || true
+          # The stock brew ldid emits dual-CodeDirectory signatures that iPadOS
+          # rejects for loaded arm64e dylibs; the scripts want Procursus ldid.
+          if brew list --versions ldid >/dev/null 2>&1; then
+            brew uninstall --ignore-dependencies ldid || true
+          fi
+          brew install ldid-procursus dpkg
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          for tool in ldid dpkg-deb python3 xcrun ditto plutil xattr rsync shasum unzip; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "missing tool: $tool" >&2; exit 1; }
+          done
+          ldid --version 2>/dev/null || true
+          dpkg-deb --version
+
+      - name: Fetch the standard deb (basedeb mode)
+        if: github.event.inputs.mode != 'full'
+        env:
+          URL: ${{ github.event.inputs.base_deb_url || 'https://github.com/nfzerox/VirtualMacOniPad/releases/download/1.2.3/VirtualMac_1.2.3.deb' }}
+          SHA256: ${{ github.event.inputs.base_deb_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$VZ_BUILD_ROOT/inputs"
+          deb="$VZ_BUILD_ROOT/inputs/base.deb"
+          curl --fail --location --retry 3 --output "$deb.part" "$URL"
+          mv "$deb.part" "$deb"
+          if [[ -n "${SHA256}" ]]; then
+            actual="$(shasum -a 256 "$deb" | awk '{print $1}')"
+            [[ "$actual" == "$SHA256" ]] || {
+              echo "base deb sha256 mismatch: $actual" >&2
+              exit 1
+            }
+          fi
+          package="$(dpkg-deb -f "$deb" Package)"
+          [[ "$package" == "com.mac.virtual" ]] || {
+            echo "unexpected base package: $package" >&2
+            exit 1
+          }
+          echo "VZ_BASE_DEB=$deb" >> "$GITHUB_ENV"
+          ls -lh "$deb"
+
+      - name: Build the roothide package (basedeb mode)
+        if: github.event.inputs.mode != 'full'
+        env:
+          DEVELOPMENT: ${{ github.event.inputs.development }}
+        run: |
+          set -euo pipefail
+          : "${VZ_BASE_DEB:?base deb was not staged}"
+          args=()
+          [[ "$DEVELOPMENT" == "true" ]] && args+=(--development)
+          cd VirtualMac
+          ./scripts/build-roothide-deb.sh ${args[@]+"${args[@]}"}
+
+      - name: Rebuild everything from source (full mode)
+        if: github.event.inputs.mode == 'full'
+        env:
+          CI: true
+          XCODE_APP: ${{ github.event.inputs.xcode_app }}
+        run: |
+          set -euo pipefail
+          cd VirtualMac
+          app="${XCODE_APP:-Xcode}"
+          ./setup.sh \
+            --xcode "/Applications/$app.app/Contents/Developer" \
+            --build-dir "$VZ_BUILD_ROOT" \
+            --download-dir "$VZ_BUILD_ROOT/downloads"
+
+      - name: Package details
+        id: details
+        run: |
+          set -euo pipefail
+          deb="$VZ_BUILD_ROOT/roothide/VirtualMac_roothide.deb"
+          [[ -f "$deb" ]] || { echo "roothide deb not found at $deb" >&2; exit 1; }
+          dpkg-deb -I "$deb"
+          dpkg-deb -c "$deb" | head -20
+          size="$(du -h "$deb" | awk '{print $1}')"
+          sha="$(shasum -a 256 "$deb" | awk '{print $1}')"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          cp "$deb" "$RUNNER_TEMP/VirtualMac_roothide.deb"
+          {
+            echo '### VirtualMac_roothide.deb'
+            echo
+            echo "- mode: ${{ github.event.inputs.mode || 'basedeb' }}"
+            echo "- size: $size"
+            echo "- sha256: \`$sha\`"
+            echo "- source input: $(cat "$VZ_BUILD_ROOT/roothide/build-source.txt" 2>/dev/null | tr '\n' ' ' || true)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: VirtualMac_roothide-${{ github.run_number }}
+          path: ${{ github.workspace }}/build/roothide/VirtualMac_roothide.deb
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Publish release
+        if: github.event.inputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          deb="$RUNNER_TEMP/VirtualMac_roothide.deb"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$deb" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$deb" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Virtual Mac roothide $TAG" \
+              --notes "Built from $GITHUB_REPOSITORY@$GITHUB_SHA (workflow run $GITHUB_RUN_ID)."
+          fi
